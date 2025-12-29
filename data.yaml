@@ -1,0 +1,6 @@
+train: archive (1)/images/train
+val: archive (1)/images/val
+test: archive (1)/images/test
+
+nc: 4
+names: ['helmet', 'vest', 'head', 'person']
