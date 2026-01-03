@@ -13,6 +13,7 @@ CONF_THRESHOLD = 75
 FACE_CONF_THRESHOLD = 70
 VIOLATION_INTERVAL = 5
 SMOOTHING_FRAMES = 5
+GRACE_PERIOD = 2  # seconds
 
 # ================= LOAD MODELS =================
 helmet_model = tf.keras.models.load_model("helmet_model.h5")
@@ -29,13 +30,16 @@ face_names = ["Santhosh", "Srikanth"]
 # ================= FACE DETECTOR =================
 face_cascade = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
 
-# ================= CSV =================
-CSV_FILE = "ppe_report.csv"
-with open(CSV_FILE, "w", newline="") as f:
-    csv.writer(f).writerow(
-        ["Time", "Name", "Helmet %", "Mask %", "Vest %", "Status",
-         "Violation Duration (s)", "Severity"]
-    )
+# ================= DAILY CSV =================
+TODAY = datetime.now().strftime("%Y-%m-%d")
+CSV_FILE = f"ppe_report_{TODAY}.csv"
+
+if not os.path.exists(CSV_FILE):
+    with open(CSV_FILE, "w", newline="") as f:
+        csv.writer(f).writerow([
+            "Time", "Name", "Helmet %", "Mask %",
+            "Vest %", "Status", "Violation Duration (s)", "Severity"
+        ])
 
 # ================= MEMORY =================
 buffers = {}
@@ -43,7 +47,10 @@ last_status = {}
 last_violation_time = {}
 violation_start_time = {}
 
-# ================= FPS / LATENCY BUFFERS =================
+# ================= ANALYTICS =================
+violation_stats = {"helmet": 0, "mask": 0, "vest": 0}
+
+# ================= FPS =================
 fps_buffer = deque(maxlen=10)
 latency_buffer = deque(maxlen=10)
 
@@ -62,19 +69,15 @@ def predict(model, img):
     conf = float(pred[cls] * 100)
     return cls, conf
 
-# ================= PERSON COLORS =================
-PERSON_COLORS = [
-    (120, 60, 0),
-    (80, 0, 120),
-    (0, 80, 120),
-]
+# ================= COLORS =================
+PERSON_COLORS = [(120,60,0),(80,0,120),(0,80,120)]
 
-# ================= CREATE VIOLATION FOLDER =================
+# ================= FOLDER =================
 os.makedirs("violations", exist_ok=True)
 
 # ================= MAIN LOOP =================
 while True:
-    frame_start = time.time()   # 🔴 FPS TIMER START
+    frame_start = time.time()
 
     ret, frame = cap.read()
     if not ret:
@@ -87,16 +90,14 @@ while True:
     panel_data = []
 
     for i, (fx, fy, fw, fh) in enumerate(faces):
-
         if fw * fh < 0.03 * H * W:
             continue
 
         person_id = f"{fx//50}_{fy//50}"
 
-        # ---------- FACE NAME ----------
+        # ---------- FACE ----------
         person_name = "UNKNOWN"
-        face_img = frame[fy:fy+fh, fx:fx+fw]
-        fid, fconf = predict(face_model, face_img)
+        fid, fconf = predict(face_model, frame[fy:fy+fh, fx:fx+fw])
         if fid is not None and fconf >= FACE_CONF_THRESHOLD:
             person_name = face_names[fid]
 
@@ -125,14 +126,10 @@ while True:
         vx1, vx2 = fx + int(0.1*fw), fx + int(0.9*fw)
         vy1, vy2 = fy + fh + 10, min(H, fy + fh + int(1.2*fh))
 
-        helmet_region = frame[hy1:hy2, hx1:hx2]
-        mask_region   = frame[my1:my2, mx1:mx2]
-        vest_region   = frame[vy1:vy2, vx1:vx2]
-
         # ---------- PREDICT ----------
-        h_cls, h_raw = predict(helmet_model, helmet_region)
-        m_cls, m_raw = predict(mask_model, mask_region)
-        v_cls, v_raw = predict(vest_model, vest_region)
+        h_cls, h_raw = predict(helmet_model, frame[hy1:hy2, hx1:hx2])
+        m_cls, m_raw = predict(mask_model, frame[my1:my2, mx1:mx2])
+        v_cls, v_raw = predict(vest_model, frame[vy1:vy2, vx1:vx2])
 
         if h_cls is not None:
             buffers[person_id]["h_conf"].append(h_raw)
@@ -148,21 +145,11 @@ while True:
         mconf = np.mean(buffers[person_id]["m_conf"])
         vconf = np.mean(buffers[person_id]["v_conf"])
 
-        helmet_ok = Counter(buffers[person_id]["h_cls"]).most_common(1)[0][0] == "with_helmet" and hconf >= CONF_THRESHOLD
-        mask_ok   = Counter(buffers[person_id]["m_cls"]).most_common(1)[0][0] == "with_mask" and mconf >= CONF_THRESHOLD
-        vest_ok   = Counter(buffers[person_id]["v_cls"]).most_common(1)[0][0] == "with_vest" and vconf >= CONF_THRESHOLD
+        helmet_ok = Counter(buffers[person_id]["h_cls"]).most_common(1)[0][0]=="with_helmet" and hconf>=CONF_THRESHOLD
+        mask_ok   = Counter(buffers[person_id]["m_cls"]).most_common(1)[0][0]=="with_mask" and mconf>=CONF_THRESHOLD
+        vest_ok   = Counter(buffers[person_id]["v_cls"]).most_common(1)[0][0]=="with_vest" and vconf>=CONF_THRESHOLD
 
         status = "PPE COMPLIANT" if helmet_ok and mask_ok and vest_ok else "PPE NOT COMPLIANT"
-
-        # ---------- SEVERITY ----------
-        if status == "PPE COMPLIANT":
-            severity = "SAFE"
-        elif not helmet_ok:
-            severity = "HIGH"
-        elif not mask_ok:
-            severity = "MEDIUM"
-        else:
-            severity = "LOW"
 
         # ---------- VIOLATION TIMER ----------
         now = time.time()
@@ -174,76 +161,65 @@ while True:
             violation_duration = 0
             violation_start_time[person_id] = None
 
-        # ---------- CAPTURE IMAGE + BEEP ----------
-        if status == "PPE NOT COMPLIANT" and now - last_violation_time[person_id] >= VIOLATION_INTERVAL:
-            winsound.Beep(1000, 500)
-            filename = f"violations/{person_name}_{severity}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jpg"
-            cv2.imwrite(filename, frame)
+        # ---------- SEVERITY ----------
+        if status == "PPE COMPLIANT":
+            severity = "SAFE"
+        elif violation_duration < 5:
+            severity = "LOW"
+        elif violation_duration < 10:
+            severity = "MEDIUM"
+        else:
+            severity = "HIGH"
+
+        # ---------- ANALYTICS ----------
+        if status == "PPE NOT COMPLIANT":
+            if not helmet_ok: violation_stats["helmet"] += 1
+            if not mask_ok:   violation_stats["mask"] += 1
+            if not vest_ok:   violation_stats["vest"] += 1
+
+        # ---------- SNAPSHOT ----------
+        if status=="PPE NOT COMPLIANT" and violation_duration>=GRACE_PERIOD and now-last_violation_time[person_id]>=VIOLATION_INTERVAL:
+            winsound.Beep(1000,500)
+            crop = frame[max(0,fy-50):min(H,vy2+50), max(0,fx-50):min(W,vx2+50)]
+            cv2.imwrite(f"violations/{person_name}_{severity}_{datetime.now().strftime('%H-%M-%S')}.jpg", crop)
             last_violation_time[person_id] = now
-
-        base_color = PERSON_COLORS[i % len(PERSON_COLORS)]
-        color = base_color if status == "PPE COMPLIANT" else (0,0,255)
-
-        # ---------- DRAW ----------
-        cv2.rectangle(frame, (hx1,hy1),(hx2,hy2), color, 3)
-        cv2.rectangle(frame, (mx1,my1),(mx2,my2), color, 3)
-        cv2.rectangle(frame, (vx1,vy1),(vx2,vy2), color, 3)
-
-        panel_data.append((hconf, mconf, vconf,
-                           helmet_ok, mask_ok, vest_ok,
-                           violation_duration, severity))
 
         # ---------- CSV ----------
         if status != last_status[person_id]:
             with open(CSV_FILE, "a", newline="") as f:
                 csv.writer(f).writerow([
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    datetime.now().strftime("%H:%M:%S"),
                     person_name,
-                    f"{hconf:.1f}",
-                    f"{mconf:.1f}",
-                    f"{vconf:.1f}",
-                    status,
-                    violation_duration,
-                    severity
+                    f"{hconf:.1f}", f"{mconf:.1f}", f"{vconf:.1f}",
+                    status, violation_duration, severity
                 ])
             last_status[person_id] = status
 
-    # ---------- LEFT PANEL ----------
+        panel_data.append((hconf,mconf,vconf,helmet_ok,mask_ok,vest_ok,violation_duration,severity))
+
+    # ---------- OVERLAY ----------
     y = 30
-    for i, (h,m,v,hok,mok,vok,vdur,sever) in enumerate(panel_data):
-        cv2.putText(frame, f"Person {i+1}", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, PERSON_COLORS[i % len(PERSON_COLORS)], 2)
-        y += 25
-        cv2.putText(frame, f"Helmet: {int(h)}%", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (0,255,0) if hok else (0,0,255), 2)
-        y += 20
-        cv2.putText(frame, f"Mask: {int(m)}%", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (0,255,0) if mok else (0,0,255), 2)
-        y += 20
-        cv2.putText(frame, f"Vest: {int(v)}%", (20, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (0,255,0) if vok else (0,0,255), 2)
-        y += 20
-        if vdur > 0:
-            cv2.putText(frame, f"Violation: {vdur}s | {sever}",
-                        (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
-            y += 20
-        y += 10
+    for i,(h,m,v,hok,mok,vok,vdur,sev) in enumerate(panel_data):
+        cv2.putText(frame,f"Person {i+1}",(20,y),cv2.FONT_HERSHEY_SIMPLEX,0.7,PERSON_COLORS[i%3],2); y+=25
+        cv2.putText(frame,f"Helmet {int(h)}%",(20,y),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0) if hok else (0,0,255),2); y+=20
+        cv2.putText(frame,f"Mask {int(m)}%",(20,y),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0) if mok else (0,0,255),2); y+=20
+        cv2.putText(frame,f"Vest {int(v)}%",(20,y),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0) if vok else (0,0,255),2); y+=20
+        if vdur>0:
+            cv2.putText(frame,f"Violation {vdur}s | {sev}",(20,y),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
+            y+=25
+        y+=10
 
-    # ---------- FPS & LATENCY ----------
-    frame_time = time.time() - frame_start
-    fps = 1.0 / frame_time if frame_time > 0 else 0
-    latency_ms = frame_time * 1000
+    # ---------- FPS ----------
+    ft = time.time()-frame_start
+    fps_buffer.append(1/ft if ft>0 else 0)
+    latency_buffer.append(ft*1000)
 
-    fps_buffer.append(fps)
-    latency_buffer.append(latency_ms)
+    cv2.putText(frame,f"FPS {sum(fps_buffer)/len(fps_buffer):.1f}",(20,H-40),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,255),2)
+    cv2.putText(frame,f"Latency {sum(latency_buffer)/len(latency_buffer):.0f} ms",(20,H-15),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,255),2)
 
-    cv2.putText(frame, f"FPS: {sum(fps_buffer)/len(fps_buffer):.1f}",
-                (20, H - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-    cv2.putText(frame, f"Latency: {sum(latency_buffer)/len(latency_buffer):.0f} ms",
-                (20, H - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+    cv2.putText(frame,f"Helmet Vio: {violation_stats['helmet']}",(W-300,30),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
+    cv2.putText(frame,f"Mask Vio: {violation_stats['mask']}",(W-300,55),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
+    cv2.putText(frame,f"Vest Vio: {violation_stats['vest']}",(W-300,80),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
 
     cv2.imshow("PPE Compliance System", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
